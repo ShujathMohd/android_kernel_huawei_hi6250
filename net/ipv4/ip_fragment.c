@@ -340,11 +340,13 @@ static int ip_frag_reinit(struct ipq *qp)
 /* Add new segment to existing queue. */
 static int ip_frag_queue(struct ipq *qp, struct sk_buff *skb)
 {
-	struct sk_buff *prev, *next;
+	struct net *net = container_of(qp->q.net, struct net, ipv4.frags);
+	struct rb_node **rbn, *parent;
+	struct sk_buff *skb1, *prev_tail;
+	int ihl, end, skb1_run_end;
 	struct net_device *dev;
 	unsigned int fragsize;
 	int flags, offset;
-	int ihl, end;
 	int err = -ENOENT;
 	u8 ecn;
 
@@ -403,9 +405,20 @@ static int ip_frag_queue(struct ipq *qp, struct sk_buff *skb)
 	if (err)
 		goto err;
 
-	/* Find out which fragments are in front and at the back of us
-	 * in the chain of fragments so far.  We must know where to put
-	 * this fragment, right?
+	/* Note : skb->rbnode and skb->dev share the same location. */
+	dev = skb->dev;
+	/* Makes sure compiler wont do silly aliasing games */
+	barrier();
+
+	/* RFC5722, Section 4, amended by Errata ID : 3089
+	 *                          When reassembling an IPv6 datagram, if
+	 *   one or more its constituent fragments is determined to be an
+	 *   overlapping fragment, the entire datagram (and any constituent
+	 *   fragments) MUST be silently discarded.
+	 *
+	 * We do the same here for IPv4 (and increment an snmp counter) but
+	 * we do not want to drop the whole queue in response to a duplicate
+	 * fragment.
 	 */
 	prev = qp->q.fragments_tail;
 	if (!prev || FRAG_CB(prev)->offset < offset) {
@@ -419,25 +432,45 @@ static int ip_frag_queue(struct ipq *qp, struct sk_buff *skb)
 		prev = next;
 	}
 
-found:
-	/* We found where to put this one.  Check for overlap with
-	 * preceding fragment, and, if needed, align things so that
-	 * any overlaps are eliminated.
-	 */
-	if (prev) {
-		int i = (FRAG_CB(prev)->offset + prev->len) - offset;
-
-		if (i > 0) {
-			offset += i;
-			err = -EINVAL;
-			if (end <= offset)
-				goto err;
-			err = -ENOMEM;
-			if (!pskb_pull(skb, i))
-				goto err;
-			if (skb->ip_summed != CHECKSUM_UNNECESSARY)
-				skb->ip_summed = CHECKSUM_NONE;
-		}
+	/* Find out where to put this fragment.  */
+	prev_tail = qp->q.fragments_tail;
+	if (!prev_tail)
+		ip4_frag_create_run(&qp->q, skb);  /* First fragment. */
+	else if (prev_tail->ip_defrag_offset + prev_tail->len < end) {
+		/* This is the common case: skb goes to the end. */
+		/* Detect and discard overlaps. */
+		if (offset < prev_tail->ip_defrag_offset + prev_tail->len)
+			goto discard_qp;
+		if (offset == prev_tail->ip_defrag_offset + prev_tail->len)
+			ip4_frag_append_to_last_run(&qp->q, skb);
+		else
+			ip4_frag_create_run(&qp->q, skb);
+	} else {
+		/* Binary search. Note that skb can become the first fragment,
+		 * but not the last (covered above).
+		 */
+		rbn = &qp->q.rb_fragments.rb_node;
+		do {
+			parent = *rbn;
+			skb1 = rb_to_skb(parent);
+			skb1_run_end = skb1->ip_defrag_offset +
+				       FRAG_CB(skb1)->frag_run_len;
+			if (end <= skb1->ip_defrag_offset)
+				rbn = &parent->rb_left;
+			else if (offset >= skb1_run_end)
+				rbn = &parent->rb_right;
+			else if (offset >= skb1->ip_defrag_offset &&
+				 end <= skb1_run_end)
+				goto err; /* No new data, potential duplicate */
+			else
+				goto discard_qp; /* Found an overlap */
+		} while (*rbn);
+		/* Here we have parent properly set, and rbn pointing to
+		 * one of its NULL left/right children. Insert skb.
+		 */
+		ip4_frag_init_run(skb);
+		rb_link_node(&skb->rbnode, parent, rbn);
+		rb_insert_color(&skb->rbnode, &qp->q.rb_fragments);
 	}
 
 	err = -ENOMEM;
